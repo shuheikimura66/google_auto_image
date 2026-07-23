@@ -60,6 +60,27 @@ function buildAssetReportUrl(account) {
   return `https://ads.google.com/aw/assetreport/performance?ocid=${ocid}&ascid=${ocid}&workspaceId=0`;
 }
 
+/**
+ * role + 候補名(複数)を順番に試し、最初に見つかったものをクリックする。
+ * UI言語が日本語/英語のどちらでレンダリングされても対応できるようにするためのヘルパー。
+ * names には文字列または正規表現を混在させて渡せる。
+ */
+async function clickByAnyName(page, role, names, options = {}) {
+  const tried = [];
+  for (const name of names) {
+    tried.push(name.toString());
+    const locator = page.getByRole(role, { name, ...options });
+    try {
+      await locator.first().waitFor({ state: 'visible', timeout: 5000 });
+      await locator.first().click();
+      return name;
+    } catch (err) {
+      // このnameでは見つからなかったので次の候補を試す
+    }
+  }
+  throw new Error(`要素が見つかりませんでした (role: ${role}, 試した名前: ${tried.join(' / ')})`);
+}
+
 /** page.gotoをリトライ付きで実行する（scrape_demandgen_images.jsと同仕様） */
 async function gotoWithRetry(page, url, options = {}, maxAttempts = 2) {
   let lastErr;
@@ -78,16 +99,19 @@ async function gotoWithRetry(page, url, options = {}, maxAttempts = 2) {
   throw lastErr;
 }
 
-/** 期間セレクタを開き、「今月」を選択して適用する */
+/** 期間セレクタを開き、「今月」/「This month」を選択して適用する（日英どちらのUIでも対応） */
 async function setDateRangeToThisMonth(page) {
-  const dateRangeButton = page.getByRole('button', { name: /^\d{4}年\d{1,2}月\d{1,2}日/ });
-  await dateRangeButton.click();
+  // 日付範囲ボタンのテキストは動的（現在の期間表示）なので、
+  // 日本語形式(2026年7月1日〜)・英語形式(Jul 1, 2026〜)の両方にマッチする正規表現を用意
+  const dateRangeButtonNamePatterns = [
+    /^\d{4}年\d{1,2}月\d{1,2}日/, // 例: 2026年7月1日〜23日
+    /^[A-Za-z]{3,9}\.?\s\d{1,2}/, // 例: Jul 1 – 23, 2026 / July 1 - 23, 2026
+  ];
+  await clickByAnyName(page, 'button', dateRangeButtonNamePatterns);
 
-  const thisMonthOption = page.getByRole('menuitemradio', { name: '今月', exact: true });
-  await thisMonthOption.click();
+  await clickByAnyName(page, 'menuitemradio', ['今月', 'This month']);
 
-  const applyButton = page.getByRole('button', { name: '適用', exact: true });
-  await applyButton.click();
+  await clickByAnyName(page, 'button', ['適用', 'Apply']);
 
   // 反映待ち
   await page.waitForTimeout(1000);
@@ -98,11 +122,10 @@ async function setDateRangeToThisMonth(page) {
  * 「表示項目の設定を保存する」以外の未チェック項目を全てONにして適用する。
  */
 async function enableAllColumns(page) {
-  const columnsButton = page.getByRole('button', { name: '表示項目', exact: true });
-  await columnsButton.click();
+  await clickByAnyName(page, 'button', ['表示項目', 'Columns']);
   await page.waitForTimeout(500);
 
-  // 全カテゴリパネルを展開
+  // 全カテゴリパネルを展開（言語非依存: aria-expanded属性で判定）
   await page.evaluate(async () => {
     const headers = Array.from(document.querySelectorAll('material-expansionpanel .header'));
     for (const h of headers) {
@@ -113,7 +136,8 @@ async function enableAllColumns(page) {
     }
   });
 
-  // 未チェックのチェックボックスを全てON（「設定を保存する」チェックボックスは除外）
+  // 未チェックのチェックボックスを全てON（言語非依存: クラス名・aria-checkedで判定。
+  // 「設定を保存する」チェックボックスは除外）
   const clickedCount = await page.evaluate(async () => {
     const boxes = Array.from(document.querySelectorAll('material-checkbox'));
     let clicked = 0;
@@ -129,15 +153,13 @@ async function enableAllColumns(page) {
   });
   console.log(`  表示項目: 新たに ${clickedCount} 件をONにしました`);
 
-  const applyButton = page.getByRole('button', { name: '適用', exact: true });
-  await applyButton.click();
+  await clickByAnyName(page, 'button', ['適用', 'Apply']);
   await page.waitForTimeout(1000);
 }
 
 /** 「ダウンロード」→「Excel .csv」でCSVをエクスポートし、ローカルに保存してパスを返す */
 async function downloadCsv(page, cid) {
-  const downloadButton = page.getByRole('button', { name: 'ダウンロード', exact: true });
-  await downloadButton.click();
+  await clickByAnyName(page, 'button', ['ダウンロード', 'Download']);
 
   const excelCsvOption = page.getByRole('menuitem', { name: 'Excel .csv', exact: true });
 
@@ -247,6 +269,11 @@ async function main() {
   const context = await browser.newContext({
     storageState: STORAGE_STATE_PATH,
     acceptDownloads: true,
+    locale: 'ja-JP',
+    extraHTTPHeaders: {
+      'Accept-Language': 'ja-JP,ja;q=0.9',
+    },
+    viewport: { width: 1600, height: 900 },
   });
   const page = await context.newPage();
 
