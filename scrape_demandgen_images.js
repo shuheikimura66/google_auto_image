@@ -7,7 +7,7 @@
  *   1. GAS Web App から「稼働中」アカウント一覧 (CID + 親Driveフォルダ) を取得
  *   2. 各CIDについて、MCCを経由せず直接
  *        https://ads.google.com/aw/assetreport/performance?ocid={CID}&ascid={CID}
- *      へ遷移
+ *      へ遷移（タイムアウト等で失敗した場合は1回リトライ）
  *   3. ページを自動スクロールし、仮想スクロールで遅延ロードされる
  *      画像アセット行をすべて収集（ファイル名で重複排除）
  *   4. 各画像URL (tpc.googlesyndication.com/simgad/...) を直接fetchしてダウンロード
@@ -187,15 +187,36 @@ async function reportAccountStatus(cid, accountStatus, message) {
   }
 }
 
+/**
+ * page.gotoをリトライ付きで実行する。
+ * 1回目が失敗した場合、少し待ってから2回目を試す（合計最大2回）。
+ */
+async function gotoWithRetry(page, url, options = {}, maxAttempts = 2) {
+  let lastErr;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      await page.goto(url, options);
+      return; // 成功したら終了
+    } catch (err) {
+      lastErr = err;
+      console.warn(`  ⚠ ページ遷移失敗 (試行 ${attempt}/${maxAttempts}): ${err.message}`);
+      if (attempt < maxAttempts) {
+        await page.waitForTimeout(3000); // 少し待ってから再試行
+      }
+    }
+  }
+  throw lastErr; // 全試行が失敗したら最後のエラーを投げる
+}
+
 async function processAccount(page, account) {
   console.log(`\n=== ${account.name} (${account.cid}) ===`);
   const url = buildAssetReportUrl(account);
 
   try {
-    await page.goto(url, { waitUntil: 'networkidle' });
+    await gotoWithRetry(page, url, { waitUntil: 'networkidle' });
   } catch (gotoErr) {
-    // ページ遷移自体が失敗した場合はアカウント全体をエラーとして報告
-    await reportAccountStatus(account.cid, 'ERROR', `ページ遷移失敗: ${gotoErr.message}`);
+    // リトライしても失敗した場合はアカウント全体をエラーとして報告
+    await reportAccountStatus(account.cid, 'ERROR', `ページ遷移失敗(リトライ後): ${gotoErr.message}`);
     throw gotoErr;
   }
 
