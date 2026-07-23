@@ -10,11 +10,13 @@
  *      へ遷移（タイムアウト等で失敗した場合は1回リトライ）
  *   3. ページを自動スクロールし、仮想スクロールで遅延ロードされる
  *      画像アセット行をすべて収集（ファイル名で重複排除）
- *   4. 各画像URL (tpc.googlesyndication.com/simgad/...) を直接fetchしてダウンロード
+ *   4. ダウンロード前に、GASから「そのCIDで処理済みのファイル名一覧」を1回だけ取得し、
+ *      新規のものだけに絞り込む（既存分は画像を一切ダウンロードしない）
+ *   5. 新規の画像URL (tpc.googlesyndication.com/simgad/...) を直接fetchしてダウンロード
  *      （認証不要で取得可能なことを確認済み）
- *   5. GAS Web App に (cid, filename, imageBase64) をPOSTし、
- *      Drive内のCIDサブフォルダへ格納 + 重複ログ管理はGAS側に一任
- *   6. 各アカウントの処理完了後、成功/一部エラー/エラーをGASへ報告し、
+ *   6. GAS Web App に (cid, filename, imageBase64) をPOSTし、
+ *      Drive内のCIDサブフォルダへ格納 + 取得ログへの記録はGAS側に一任
+ *   7. 各アカウントの処理完了後、成功/一部エラー/エラーをGASへ報告し、
  *      「アカウント管理」シートのF列(最終稼働日)・G列(稼働状況)を更新する
  *
  * 前提:
@@ -48,6 +50,18 @@ async function fetchActiveAccounts() {
     throw new Error(`アカウント一覧の取得に失敗: ${data.message}`);
   }
   return data.accounts; // [{cid, name, parentFolder}, ...]
+}
+
+/** 指定CIDについて、GAS側で処理済み(=Drive格納済み)のファイル名一覧を取得する */
+async function fetchProcessedFilenames(cid) {
+  const url = `${GAS_WEBAPP_URL}?secret=${encodeURIComponent(GAS_SHARED_SECRET)}&cid=${encodeURIComponent(cid)}`;
+  const res = await fetch(url);
+  const data = await res.json();
+  if (data.status !== 'success') {
+    console.warn(`  ⚠ 処理済み一覧の取得に失敗: ${data.message}（フィルタ無しで全件処理します）`);
+    return [];
+  }
+  return data.filenames || [];
 }
 
 /** CID (例: 114-437-3197) から ocid用の数値文字列は使わず、そのままURLパラメータに使う。
@@ -225,16 +239,32 @@ async function processAccount(page, account) {
   const assets = await collectImageAssets(page);
   console.log(`  画像アセット ${assets.length} 件を検出`);
 
+  // --- ダウンロード前に、GAS側で処理済みのファイル名一覧を1回だけ取得してフィルタ ---
+  const processedFilenames = new Set(await fetchProcessedFilenames(account.cid));
+  const newAssets = assets.filter((a) => !processedFilenames.has(a.filename));
+  const skippedCount = assets.length - newAssets.length;
+
+  if (skippedCount > 0) {
+    console.log(`  - スキップ(既存・ダウンロード無し): ${skippedCount} 件`);
+  }
+
+  if (newAssets.length === 0) {
+    console.log('  新規画像なし。このアカウントの処理を終了します。');
+    await reportAccountStatus(account.cid, 'OK', null);
+    return;
+  }
+
   let errorCount = 0;
   const errorMessages = [];
 
-  for (const asset of assets) {
+  for (const asset of newAssets) {
     try {
       const { base64, mimeType } = await downloadImageAsBase64(page, asset.src);
       const result = await uploadToGas(account.cid, asset.filename, base64, mimeType);
       if (result.status === 'success') {
         console.log(`  ✓ 保存: ${asset.filename}`);
       } else if (result.status === 'skipped') {
+        // 事前フィルタ後もここに来るのは想定外だが、念のため対応
         console.log(`  - スキップ(既存): ${asset.filename}`);
       } else {
         console.warn(`  ✗ 失敗: ${asset.filename} -> ${result.message}`);
@@ -255,7 +285,7 @@ async function processAccount(page, account) {
     await reportAccountStatus(
       account.cid,
       'PARTIAL',
-      `${errorCount}/${assets.length}件失敗: ${errorMessages.join(' / ')}`
+      `${errorCount}/${newAssets.length}件失敗: ${errorMessages.join(' / ')}`
     );
   }
 }
