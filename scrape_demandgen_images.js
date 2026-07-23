@@ -186,6 +186,7 @@ async function reportAccountStatus(cid, accountStatus, message) {
       body: JSON.stringify({
         secret: GAS_SHARED_SECRET,
         type: 'accountStatus',
+        source: 'imageSync',
         cid,
         accountStatus,
         message: message || null,
