@@ -1,209 +1,259 @@
 /**
  * ==============================================================
- * デマンドジェネレーション画像 自動取得スクリプト (Playwright)
+ * デマンドジェネレーション画像 自動格納 GAS Web App
  * ==============================================================
  *
- * 全体フロー:
- *   1. GAS Web App から「稼働中」アカウント一覧 (CID + 親Driveフォルダ) を取得
- *   2. 各CIDについて、MCCを経由せず直接
- *        https://ads.google.com/aw/assetreport/performance?ocid={CID}&ascid={CID}
- *      へ遷移
- *   3. ページを自動スクロールし、仮想スクロールで遅延ロードされる
- *      画像アセット行をすべて収集（ファイル名で重複排除）
- *   4. 各画像URL (tpc.googlesyndication.com/simgad/...) を直接fetchしてダウンロード
- *      （認証不要で取得可能なことを確認済み）
- *   5. GAS Web App に (cid, filename, imageBase64) をPOSTし、
- *      Drive内のCIDサブフォルダへ格納 + 重複ログ管理はGAS側に一任
+ * 役割:
+ *   Playwright側から「CID・ファイル名・画像バイナリ(base64)」をPOSTされたら、
+ *   1. アカウント管理シートから該当CIDの親Driveフォルダを取得
+ *   2. 親フォルダ配下に「CID」名のサブフォルダを取得 or 新規作成
+ *   3. 取得ログシートで (CID + ファイル名) の重複をチェック
+ *   4. 未処理であれば画像をサブフォルダに保存
+ *   5. 取得ログシートに記録
  *
- * 前提:
- *   - ログイン状態は storageState (Cookie) を使い回す想定。
- *     初回のみ手動ログインしてstorageStateを保存してください。
- *       npx playwright open https://ads.google.com --save-storage=auth.json
- *   - 環境変数 GAS_WEBAPP_URL, GAS_SHARED_SECRET を設定してください。
+ *   また、Playwright側からアカウント単位の実行結果 (type: 'accountStatus') が
+ *   POSTされた場合は、アカウント管理シートのF・G列（最終稼働日・稼働状況）を更新する。
  *
- * 実行:
- *   node scrape_demandgen_images.js
+ * スプレッドシート構成:
+ *   シート「アカウント管理」
+ *     A列: CID (例: 114-437-3197)
+ *     B列: アカウント名
+ *     C列: ステータス (「稼働中」のみ対象)
+ *     D列: 親Driveフォルダ (URL でも フォルダID でも可)
+ *     E列: ocid
+ *     F列: 最終稼働日 (Playwright実行時に自動更新)
+ *     G列: 稼働状況 ("OK" / "一部エラー: ..." / "エラー: ...")
+ *
+ *   シート「取得ログ」(なければ自動作成)
+ *     A列: CID
+ *     B列: ファイル名
+ *     C列: DriveファイルID
+ *     D列: 取得日時
+ *
+ * デプロイ:
+ *   拡張機能 > Apps Script にこのファイルを貼り付け、
+ *   「デプロイ」>「新しいデプロイ」> 種類:ウェブアプリ
+ *   実行ユーザー: 自分 / アクセスできるユーザー: 自分のみ（またはリンクを知っている全員）
+ *   発行されたURLをPlaywright側の環境変数 (GAS_WEBAPP_URL) に設定してください。
+ *
+ *   さらに、リクエストの正当性を確認するための簡易トークンを
+ *   スクリプトプロパティ「SHARED_SECRET」に設定し、Playwright側から
+ *   同じ値をヘッダー等で送る運用を推奨します（本コードでは body.secret で検証）。
  * ==============================================================
  */
 
-const { chromium } = require('playwright');
+const ACCOUNT_SHEET_NAME = 'アカウント管理';
+const LOG_SHEET_NAME = '取得ログ';
 
-const GAS_WEBAPP_URL = process.env.GAS_WEBAPP_URL;
-const GAS_SHARED_SECRET = process.env.GAS_SHARED_SECRET || '';
-const STORAGE_STATE_PATH = process.env.STORAGE_STATE_PATH || 'auth.json';
+/**
+ * GET: 稼働中アカウント一覧を返す
+ * Playwright側はこれを叩いて処理対象CIDのリストを取得する。
+ * 例: GET {WebAppURL}?secret=xxxx
+ * レスポンス: { status: 'success', accounts: [{cid, name, parentFolder}, ...] }
+ */
+function doGet(e) {
+  try {
+    const expectedSecret = PropertiesService.getScriptProperties().getProperty('SHARED_SECRET');
+    if (expectedSecret && (e.parameter.secret !== expectedSecret)) {
+      return jsonResponse({ status: 'error', message: 'unauthorized' });
+    }
 
-if (!GAS_WEBAPP_URL) {
-  console.error('環境変数 GAS_WEBAPP_URL が設定されていません。');
-  process.exit(1);
-}
-
-/** GASから稼働中アカウント一覧を取得 */
-async function fetchActiveAccounts() {
-  const url = `${GAS_WEBAPP_URL}?secret=${encodeURIComponent(GAS_SHARED_SECRET)}`;
-  const res = await fetch(url);
-  const data = await res.json();
-  if (data.status !== 'success') {
-    throw new Error(`アカウント一覧の取得に失敗: ${data.message}`);
+    const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(ACCOUNT_SHEET_NAME);
+    const data = sheet.getDataRange().getValues();
+    const accounts = [];
+    for (let i = 1; i < data.length; i++) {
+      const [cid, name, status, parentFolder, ocid] = data[i];
+      if (status === '稼働中' && cid && parentFolder) {
+        accounts.push({ cid: normalizeCid(cid), name, parentFolder, ocid: ocid ? String(ocid).trim() : null });
+      }
+    }
+    return jsonResponse({ status: 'success', accounts });
+  } catch (err) {
+    return jsonResponse({ status: 'error', message: err.message });
   }
-  return data.accounts; // [{cid, name, parentFolder}, ...]
 }
 
-/** CID (例: 114-437-3197) から ocid用の数値文字列は使わず、そのままURLパラメータに使う。
- *  Google Ads の ocid はハイフン無しの内部ID (例: 7080750168) だが、
- *  スプレッドシートには表示用CID(114-437-3197)しか無いケースが多いため、
- *  実運用では「アカウント管理」シートに ocid 列を追加しておくのが確実。
- *  ここでは簡便のため、CIDのハイフンを除去した文字列を ascid としても
- *  そのままURLに使えるかを試すフォールバックにしている。
- *  ※ 確実性を優先するなら、事前に各CIDのocidを1回だけ手動で控えてシートに追加してください。
- */
-function buildAssetReportUrl(account) {
-  const ocid = account.ocid || account.cid.replace(/-/g, '');
-  return `https://ads.google.com/aw/assetreport/performance?ocid=${ocid}&ascid=${ocid}&workspaceId=0`;
+function doPost(e) {
+  try {
+    const body = JSON.parse(e.postData.contents);
+
+    // --- 簡易認証 ---
+    const expectedSecret = PropertiesService.getScriptProperties().getProperty('SHARED_SECRET');
+    if (expectedSecret && body.secret !== expectedSecret) {
+      return jsonResponse({ status: 'error', message: 'unauthorized' });
+    }
+
+    // --- アカウント実行結果の報告（画像アップロードとは別ルート） ---
+    if (body.type === 'accountStatus') {
+      return handleAccountStatusReport(body);
+    }
+
+    const cid = normalizeCid(body.cid);
+    const filename = body.filename;
+    const base64Data = body.imageBase64; // データURL prefix なしの純粋なbase64を想定
+    const mimeType = body.mimeType || 'image/png';
+
+    if (!cid || !filename || !base64Data) {
+      return jsonResponse({ status: 'error', message: 'missing required fields (cid, filename, imageBase64)' });
+    }
+
+    // --- 重複チェック ---
+    if (isAlreadyProcessed(cid, filename)) {
+      return jsonResponse({ status: 'skipped', message: 'already processed', cid, filename });
+    }
+
+    // --- 親フォルダ取得 ---
+    const parentFolderRef = getParentFolderForCid(cid);
+    if (!parentFolderRef) {
+      return jsonResponse({ status: 'error', message: 'CID not found in account sheet or missing parent folder', cid });
+    }
+    const parentFolder = DriveApp.getFolderById(extractFolderId(parentFolderRef));
+
+    // --- CIDサブフォルダ取得 or 作成 ---
+    const subFolder = getOrCreateSubFolder(parentFolder, cid);
+
+    // --- 画像保存 ---
+    const blob = Utilities.newBlob(Utilities.base64Decode(base64Data), mimeType, filename);
+    const file = subFolder.createFile(blob);
+
+    // --- ログ記録 ---
+    appendLog(cid, filename, file.getId());
+
+    return jsonResponse({
+      status: 'success',
+      cid,
+      filename,
+      driveFileId: file.getId(),
+      driveFileUrl: file.getUrl()
+    });
+  } catch (err) {
+    return jsonResponse({ status: 'error', message: err.message, stack: err.stack });
+  }
 }
 
 /**
- * ページ内を自動スクロールしながら、画像アセット行を重複なく収集する。
- * ブラウザコンテキスト内で実行するため page.evaluate 経由。
+ * アカウント単位の実行結果（成功/エラー）を「アカウント管理」シートのF・G列に反映する。
+ * body: { cid, accountStatus: 'OK' | 'ERROR' | 'PARTIAL', message }
+ *   F列: 最終稼働日（実行日時）
+ *   G列: 稼働状況（OK / エラー内容）
  */
-async function collectImageAssets(page) {
-  return await page.evaluate(async () => {
-    function scrapeCurrent(collected) {
-      const imgs = Array.from(document.querySelectorAll('img[alt="asset image"]'));
-      imgs.forEach((img) => {
-        const row = img.closest('[role="row"]');
-        const text = row ? row.innerText : '';
-        const fnameMatch = text.match(/([\w\-]+\.(png|jpg|jpeg))/i);
-        // ファイル名が取れない場合はURL末尾のIDをフォールバックとして使う
-        const filename = fnameMatch ? fnameMatch[1] : `${img.src.split('/').pop()}.png`;
-        if (!collected.has(filename)) {
-          collected.set(filename, { src: img.src, filename });
-        }
-      });
-    }
-
-    const mainEl = document.querySelector('.main') || document.scrollingElement || document.body;
-    const collected = new Map();
-    scrapeCurrent(collected);
-
-    let lastScrollTop = -1;
-    let stableCount = 0;
-    for (let i = 0; i < 100; i++) {
-      mainEl.scrollTop += 400;
-      await new Promise((r) => setTimeout(r, 350));
-      scrapeCurrent(collected);
-      if (mainEl.scrollTop === lastScrollTop) {
-        stableCount++;
-        if (stableCount > 3) break;
-      } else {
-        stableCount = 0;
-      }
-      lastScrollTop = mainEl.scrollTop;
-    }
-    return Array.from(collected.values());
-  });
-}
-
-/** 表示行数を可能な限り大きくして仮想スクロール量を減らす（存在する場合のみ） */
-async function maximizePageSize(page) {
-  try {
-    const pageSizeButton = page.getByRole('button', { name: /表示する行数/ });
-    if (await pageSizeButton.isVisible({ timeout: 3000 })) {
-      await pageSizeButton.click();
-      const option500 = page.getByRole('option', { name: '500' });
-      if (await option500.isVisible({ timeout: 2000 })) {
-        await option500.click();
-        await page.waitForTimeout(1000);
-      } else {
-        await page.keyboard.press('Escape');
-      }
-    }
-  } catch (e) {
-    // ページサイズ変更UIが見つからなくても処理は継続する
-    console.warn('  表示行数の変更をスキップ:', e.message);
+function handleAccountStatusReport(body) {
+  const cid = normalizeCid(body.cid);
+  if (!cid) {
+    return jsonResponse({ status: 'error', message: 'cid is required for accountStatus report' });
   }
-}
 
-/** 画像をfetchしてbase64文字列に変換（認証Cookie不要） */
-async function downloadImageAsBase64(page, imageUrl) {
-  // ブラウザコンテキスト内でfetchすることで、簡易的なUA/ネットワーク経路の一貫性を保つ
-  return await page.evaluate(async (url) => {
-    const res = await fetch(url, { credentials: 'omit' });
-    const buf = await res.arrayBuffer();
-    const bytes = new Uint8Array(buf);
-    let binary = '';
-    for (let i = 0; i < bytes.byteLength; i++) {
-      binary += String.fromCharCode(bytes[i]);
-    }
-    return {
-      base64: btoa(binary),
-      mimeType: res.headers.get('content-type') || 'image/png',
-    };
-  }, imageUrl);
-}
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(ACCOUNT_SHEET_NAME);
+  const data = sheet.getDataRange().getValues();
 
-/** GAS Web AppにPOSTしてDriveへ保存 */
-async function uploadToGas(cid, filename, base64, mimeType) {
-  const res = await fetch(GAS_WEBAPP_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      secret: GAS_SHARED_SECRET,
-      cid,
-      filename,
-      imageBase64: base64,
-      mimeType,
-    }),
-  });
-  return await res.json();
-}
-
-async function processAccount(page, account) {
-  console.log(`\n=== ${account.name} (${account.cid}) ===`);
-  const url = buildAssetReportUrl(account);
-  await page.goto(url, { waitUntil: 'networkidle' });
-
-  await maximizePageSize(page);
-
-  const assets = await collectImageAssets(page);
-  console.log(`  画像アセット ${assets.length} 件を検出`);
-
-  for (const asset of assets) {
-    try {
-      const { base64, mimeType } = await downloadImageAsBase64(page, asset.src);
-      const result = await uploadToGas(account.cid, asset.filename, base64, mimeType);
-      if (result.status === 'success') {
-        console.log(`  ✓ 保存: ${asset.filename}`);
-      } else if (result.status === 'skipped') {
-        console.log(`  - スキップ(既存): ${asset.filename}`);
-      } else {
-        console.warn(`  ✗ 失敗: ${asset.filename} -> ${result.message}`);
-      }
-    } catch (err) {
-      console.error(`  ✗ エラー: ${asset.filename} ->`, err.message);
-    }
-  }
-}
-
-async function main() {
-  const accounts = await fetchActiveAccounts();
-  console.log(`対象アカウント: ${accounts.length} 件`);
-
-  const browser = await chromium.launch();
-  const context = await browser.newContext({ storageState: STORAGE_STATE_PATH });
-  const page = await context.newPage();
-
-  for (const account of accounts) {
-    try {
-      await processAccount(page, account);
-    } catch (err) {
-      console.error(`アカウント処理中にエラー (${account.cid}):`, err.message);
+  for (let i = 1; i < data.length; i++) {
+    const rowCid = normalizeCid(data[i][0]);
+    if (rowCid === cid) {
+      const rowNumber = i + 1; // シート上の実際の行番号（1-indexed、ヘッダー分+1）
+      const statusText = buildStatusText(body.accountStatus, body.message);
+      sheet.getRange(rowNumber, 6).setValue(new Date());   // F列: 最終稼働日
+      sheet.getRange(rowNumber, 7).setValue(statusText);    // G列: 稼働状況
+      return jsonResponse({ status: 'success', cid, recorded: statusText });
     }
   }
 
-  await browser.close();
+  return jsonResponse({ status: 'error', message: 'CID not found in account sheet', cid });
 }
 
-main().catch((err) => {
-  console.error('致命的エラー:', err);
-  process.exit(1);
-});
+/** G列に書き込む稼働状況の文字列を組み立てる */
+function buildStatusText(accountStatus, message) {
+  if (accountStatus === 'OK') {
+    return 'OK';
+  }
+  if (accountStatus === 'PARTIAL') {
+    return `一部エラー: ${message || ''}`;
+  }
+  return `エラー: ${message || ''}`;
+}
+
+/** CIDの表記ゆれ（ハイフンあり/なし・全角半角）を吸収 */
+function normalizeCid(cid) {
+  if (!cid) return '';
+  return cid.toString().replace(/[‐－―ー]/g, '-').trim();
+}
+
+/** URLからフォルダIDを抽出。すでにIDのみの場合はそのまま返す */
+function extractFolderId(urlOrId) {
+  const match = urlOrId.match(/[-\w]{25,}/);
+  return match ? match[0] : urlOrId;
+}
+
+/** アカウント管理シートからCIDに対応する親フォルダ(URL/ID)を取得 */
+function getParentFolderForCid(cid) {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(ACCOUNT_SHEET_NAME);
+  const data = sheet.getDataRange().getValues();
+  // 1行目はヘッダー想定
+  for (let i = 1; i < data.length; i++) {
+    const rowCid = normalizeCid(data[i][0]);
+    if (rowCid === cid) {
+      return data[i][3]; // D列: 親Driveフォルダ
+    }
+  }
+  return null;
+}
+
+/** 親フォルダ配下にCID名のサブフォルダを取得、なければ作成 */
+function getOrCreateSubFolder(parentFolder, cid) {
+  const folders = parentFolder.getFoldersByName(cid);
+  if (folders.hasNext()) {
+    return folders.next();
+  }
+  return parentFolder.createFolder(cid);
+}
+
+/** 取得ログシートを取得（なければヘッダー付きで新規作成） */
+function getLogSheet() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = ss.getSheetByName(LOG_SHEET_NAME);
+  if (!sheet) {
+    sheet = ss.insertSheet(LOG_SHEET_NAME);
+    sheet.appendRow(['CID', 'ファイル名', 'DriveファイルID', '取得日時']);
+  }
+  return sheet;
+}
+
+/** 既に処理済み（CID + ファイル名の組み合わせ）かどうかを判定 */
+function isAlreadyProcessed(cid, filename) {
+  const sheet = getLogSheet();
+  const data = sheet.getDataRange().getValues();
+  for (let i = 1; i < data.length; i++) {
+    if (normalizeCid(data[i][0]) === cid && data[i][1] === filename) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** ログシートに1行追記 */
+function appendLog(cid, filename, driveFileId) {
+  const sheet = getLogSheet();
+  sheet.appendRow([cid, filename, driveFileId, new Date()]);
+}
+
+function jsonResponse(obj) {
+  return ContentService.createTextOutput(JSON.stringify(obj))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+/**
+ * 動作確認用: スプレッドシートのメニューから手動実行してログシートの中身を確認する
+ */
+function debugPrintLog() {
+  const sheet = getLogSheet();
+  Logger.log(sheet.getDataRange().getValues());
+}
+
+/**
+ * デバッグ用: スクリプトプロパティに保存されているSHARED_SECRETの値を確認する。
+ * 実行後、「実行ログ」でJSON化された値を確認できる（前後の空白や見えない文字も可視化される）。
+ * 確認が終わったら削除してOK。
+ */
+function debugCheckSharedSecret() {
+  const value = PropertiesService.getScriptProperties().getProperty('SHARED_SECRET');
+  Logger.log('SHARED_SECRET = ' + JSON.stringify(value));
+}
