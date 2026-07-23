@@ -111,7 +111,16 @@ async function setDateRangeToThisMonth(page) {
 
   await clickByAnyName(page, 'menuitemradio', ['今月', 'This month']);
 
-  await clickByAnyName(page, 'button', ['適用', 'Apply']);
+  // 「適用」ボタンは、選択によって期間が実際に変化した場合のみ表示されることがある。
+  // 既に「今月」が選択済み（変化なし）の場合はボタンが出ずにそのまま閉じることがあるため、
+  // 見つからなくてもエラーにせず続行する。
+  try {
+    await clickByAnyName(page, 'button', ['適用', 'Apply']);
+  } catch (err) {
+    console.log('  ⚠ 「適用」ボタンが見つかりませんでした（既に今月が選択済みだった可能性）。そのまま続行します。');
+    // 万一メニューが開いたままの場合に備えて閉じておく
+    await page.keyboard.press('Escape').catch(() => {});
+  }
 
   // 反映待ち
   await page.waitForTimeout(1000);
@@ -153,7 +162,12 @@ async function enableAllColumns(page) {
   });
   console.log(`  表示項目: 新たに ${clickedCount} 件をONにしました`);
 
-  await clickByAnyName(page, 'button', ['適用', 'Apply']);
+  try {
+    await clickByAnyName(page, 'button', ['適用', 'Apply']);
+  } catch (err) {
+    console.log('  ⚠ 「適用」ボタンが見つかりませんでした（既に全項目ON済みだった可能性）。そのまま続行します。');
+    await page.keyboard.press('Escape').catch(() => {});
+  }
   await page.waitForTimeout(1000);
 }
 
