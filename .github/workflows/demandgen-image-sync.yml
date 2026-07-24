@@ -20,7 +20,7 @@ jobs:
         run: npm install
 
       - name: Playwright ブラウザのインストール
-        run: npx playwright install --with-deps chromium
+        run: npx playwright install chromium
 
       - name: ログインセッション(auth.json)を復元
         run: echo "${{ secrets.PLAYWRIGHT_STORAGE_STATE_B64 }}" | base64 --decode > auth.json
