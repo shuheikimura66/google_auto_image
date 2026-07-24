@@ -15,11 +15,11 @@
  *      へ遷移（タイムアウト時は1回リトライ）
  *   3. 期間を「今月」に変更
  *   4. 表示項目(列)をすべてON
- *   5. 「ダウンロード」→「Google スプレッドシート」でエクスポート
- *      （Excel .csvはUTF-16エンコードでGAS側から読めない問題があったため、
- *        ネイティブなGoogle Sheetとして書き出す方式に変更）
- *   6. 作成されたスプレッドシートIDをGAS Web Appに通知し、
- *      Drive内の {CID}/reports/ フォルダへ移動してもらう
+ *   5. 「ダウンロード」→「Excel .csv」でCSVをエクスポート
+ *      （Google Adsのcsv出力はUTF-16LEのため、Node.js側でBufferを
+ *        明示的にutf16leとしてデコードしてから送信し、文字化け問題を解消）
+ *   6. GAS Web Appに正しくデコード済みのCSVテキストをPOSTし、
+ *      Drive内の {CID}/reports/ フォルダへ格納
  *      （同日再実行時は上書き、ログはGAS側の「レポート取得ログ」シートで管理）
  *   7. 各アカウントの処理完了後、成功/エラーをGASへ報告し、
  *      「アカウント管理」シートのH列(CSV格納)を更新する
@@ -33,11 +33,14 @@
  * ==============================================================
  */
 
+const fs = require('fs');
+const path = require('path');
 const { chromium } = require('playwright');
 
 const GAS_WEBAPP_URL = process.env.GAS_WEBAPP_URL;
 const GAS_SHARED_SECRET = process.env.GAS_SHARED_SECRET || '';
 const STORAGE_STATE_PATH = process.env.STORAGE_STATE_PATH || 'auth.json';
+const DOWNLOAD_DIR = process.env.DOWNLOAD_DIR || 'downloads';
 
 if (!GAS_WEBAPP_URL) {
   console.error('環境変数 GAS_WEBAPP_URL が設定されていません。');
@@ -171,32 +174,25 @@ async function enableAllColumns(page) {
   await page.waitForTimeout(1000);
 }
 
-/** 「ダウンロード」→「Google スプレッドシート」でエクスポートし、作成されたスプレッドシートのIDを取得する。
- *  Excel .csv形式はUTF-16エンコードで出力されGASから正しく読めない問題があったため、
- *  ネイティブなGoogle Sheetとして書き出す方式に変更（エンコード問題を根本回避）。
- */
-async function exportToGoogleSheet(page, context) {
+/** 「ダウンロード」→「Excel .csv」でCSVをエクスポートし、ローカルに保存してパスを返す */
+async function downloadCsv(page, cid) {
   await clickByAnyName(page, 'button', ['ダウンロード', 'Download']);
 
-  const sheetOption = page.getByRole('menuitem', { name: /Google\s*スプレッドシート|Google\s*Sheets/ });
+  const excelCsvOption = page.getByRole('menuitem', { name: 'Excel .csv', exact: true });
 
-  // 「Google スプレッドシート」を選ぶと新しいタブでシートが開く
-  const [newPage] = await Promise.all([
-    context.waitForEvent('page'),
-    sheetOption.click(),
+  const [download] = await Promise.all([
+    page.waitForEvent('download'),
+    excelCsvOption.click(),
   ]);
 
-  await newPage.waitForLoadState('domcontentloaded');
-  const sheetUrl = newPage.url();
-  const match = sheetUrl.match(/\/d\/([a-zA-Z0-9_-]+)/);
-  const spreadsheetId = match ? match[1] : null;
-
-  await newPage.close();
-
-  if (!spreadsheetId) {
-    throw new Error(`スプレッドシートIDの取得に失敗しました。URL: ${sheetUrl}`);
+  if (!fs.existsSync(DOWNLOAD_DIR)) {
+    fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
   }
-  return spreadsheetId;
+
+  const dateStr = formatDateYYYYMMDD(new Date());
+  const localPath = path.join(DOWNLOAD_DIR, `${cid}_${dateStr}.csv`);
+  await download.saveAs(localPath);
+  return { localPath, dateStr };
 }
 
 function formatDateYYYYMMDD(date) {
@@ -206,17 +202,22 @@ function formatDateYYYYMMDD(date) {
   return `${y}${m}${d}`;
 }
 
-/** GAS Web Appに作成済みスプレッドシートのIDを通知し、Drive内の指定フォルダへ移動してもらう */
-async function notifyReportSheetToGas(cid, spreadsheetId, dateStr) {
+/**
+ * GAS Web AppにCSVの中身（正しくデコード済みのテキスト）をPOSTしてDriveへ保存。
+ * Google AdsのExcel .csvはUTF-16LE（先頭にBOM付き）で出力されるため、
+ * Node.jsのBufferで明示的にutf16leとしてデコードしてから送る。
+ * これによりGAS側は普通のUTF-8テキストとして受け取れる。
+ */
+async function uploadCsvToGas(cid, filename, csvText) {
   const res = await fetch(GAS_WEBAPP_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       secret: GAS_SHARED_SECRET,
-      type: 'reportSheet',
+      type: 'reportCsv',
       cid,
-      spreadsheetId,
-      dateStr,
+      filename,
+      csvText,
     }),
   });
   return await res.json();
@@ -246,7 +247,7 @@ async function reportAccountStatus(cid, accountStatus, message) {
   }
 }
 
-async function processAccount(page, context, account) {
+async function processAccount(page, account) {
   console.log(`\n=== ${account.name} (${account.cid}) ===`);
   const url = buildAssetReportUrl(account);
 
@@ -258,19 +259,30 @@ async function processAccount(page, context, account) {
 
     await enableAllColumns(page);
 
-    const dateStr = formatDateYYYYMMDD(new Date());
-    const spreadsheetId = await exportToGoogleSheet(page, context);
-    console.log(`  スプレッドシート作成完了: ${spreadsheetId}`);
+    const { localPath, dateStr } = await downloadCsv(page, account.cid);
+    console.log(`  CSVダウンロード完了: ${localPath}`);
 
-    const result = await notifyReportSheetToGas(account.cid, spreadsheetId, dateStr);
+    // Google AdsのCSVはUTF-16LE（BOM付き）で出力されるため、明示的にデコードする
+    const buffer = fs.readFileSync(localPath);
+    let csvText = buffer.toString('utf16le');
+    // 先頭のBOM文字（U+FEFF）が残っていれば取り除く
+    if (csvText.charCodeAt(0) === 0xFEFF) {
+      csvText = csvText.slice(1);
+    }
+
+    const filename = `${account.cid}_${dateStr}.csv`;
+    const result = await uploadCsvToGas(account.cid, filename, csvText);
 
     if (result.status === 'success') {
-      console.log(`  ✓ Driveへ格納: ${result.filename || spreadsheetId}`);
+      console.log(`  ✓ Driveへ格納: ${filename}`);
       await reportAccountStatus(account.cid, 'OK', null);
     } else {
       console.warn(`  ✗ Drive格納に失敗: ${result.message}`);
       await reportAccountStatus(account.cid, 'ERROR', `Drive格納失敗: ${result.message}`);
     }
+
+    // ローカルの一時ファイルを削除
+    fs.unlinkSync(localPath);
   } catch (err) {
     console.error(`  ✗ エラー: ${err.message}`);
     await reportAccountStatus(account.cid, 'ERROR', err.message);
@@ -294,7 +306,7 @@ async function main() {
   const page = await context.newPage();
 
   for (const account of accounts) {
-    await processAccount(page, context, account);
+    await processAccount(page, account);
   }
 
   await browser.close();
