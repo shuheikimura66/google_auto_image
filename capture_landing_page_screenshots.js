@@ -53,7 +53,7 @@ async function uploadScreenshotToGas(targetUrl, base64) {
       type: 'screenshotResult',
       url: targetUrl,
       imageBase64: base64,
-      mimeType: 'image/png',
+      mimeType: 'image/jpeg',
     }),
   });
   return await res.json();
@@ -105,7 +105,7 @@ async function main() {
       await page.evaluate(() => window.scrollTo(0, 0));
       await page.waitForTimeout(500); // スクロール後、先頭表示が安定するまで少し待つ
 
-      const buffer = await page.screenshot({ fullPage: true });
+      const buffer = await page.screenshot({ fullPage: true, type: 'jpeg', quality: 70 });
       const base64 = buffer.toString('base64');
 
       const result = await uploadScreenshotToGas(targetUrl, base64);
