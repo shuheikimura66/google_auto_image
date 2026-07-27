@@ -1,0 +1,29 @@
+name: 遷移先ページ スクリーンショット取得
+
+on:
+  workflow_dispatch: {} # 手動実行 or 外部(GAS)からのAPI呼び出しのみで起動
+
+jobs:
+  capture-screenshots:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: リポジトリをチェックアウト
+        uses: actions/checkout@v4
+
+      - name: Node.js セットアップ
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 依存パッケージのインストール
+        run: npm install
+
+      - name: Playwright ブラウザのインストール
+        run: npx playwright install chromium
+
+      - name: スクリーンショット取得スクリプトを実行
+        env:
+          GAS_WEBAPP_URL: ${{ secrets.GAS_WEBAPP_URL }}
+          GAS_SHARED_SECRET: ${{ secrets.GAS_SHARED_SECRET }}
+        run: node capture_landing_page_screenshots.js
