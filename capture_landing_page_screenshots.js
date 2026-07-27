@@ -59,6 +59,28 @@ async function uploadScreenshotToGas(targetUrl, base64) {
   return await res.json();
 }
 
+/** ページ末尾まで少しずつスクロールし、遅延読み込み(lazy load)の画像等を読み込ませる */
+async function autoScrollToBottom(page) {
+  await page.evaluate(async () => {
+    await new Promise((resolve) => {
+      let totalHeight = 0;
+      const distance = 400;
+      const timer = setInterval(() => {
+        const scrollHeight = document.body.scrollHeight;
+        window.scrollBy(0, distance);
+        totalHeight += distance;
+
+        if (totalHeight >= scrollHeight) {
+          clearInterval(timer);
+          resolve();
+        }
+      }, 200);
+    });
+  });
+  // スクロール完了後、直近で発火した遅延読み込みが完了するまで少し待つ
+  await page.waitForTimeout(1000);
+}
+
 async function main() {
   const pendingUrls = await fetchPendingUrls();
   console.log(`撮影対象URL: ${pendingUrls.length} 件`);
@@ -79,6 +101,10 @@ async function main() {
     console.log(`\n=== ${targetUrl} ===`);
     try {
       await page.goto(targetUrl, { waitUntil: 'networkidle', timeout: 30000 });
+      await autoScrollToBottom(page);
+      await page.evaluate(() => window.scrollTo(0, 0));
+      await page.waitForTimeout(500); // スクロール後、先頭表示が安定するまで少し待つ
+
       const buffer = await page.screenshot({ fullPage: true });
       const base64 = buffer.toString('base64');
 
