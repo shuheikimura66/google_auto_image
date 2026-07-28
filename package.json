@@ -1,5 +1,14 @@
 {
+  "name": "demandgen-image-sync",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Google Ads デマンドジェネレーション画像を自動でGoogle Driveへ格納するスクリプト",
+  "main": "scrape_demandgen_images.js",
+  "scripts": {
+    "start": "node scrape_demandgen_images.js"
+  },
   "dependencies": {
-    "playwright": "^1.61.1"
+    "playwright": "^1.46.0",
+    "sharp": "^0.33.0"
   }
 }
