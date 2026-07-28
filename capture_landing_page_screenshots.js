@@ -57,7 +57,17 @@ async function uploadScreenshotToGas(targetUrl, base64) {
       mimeType: 'image/jpeg',
     }),
   });
-  return await res.json();
+
+  const rawText = await res.text();
+  try {
+    return JSON.parse(rawText);
+  } catch (e) {
+    // GAS側がエラー時にHTMLページを返すことがあるため、JSONでない場合は分かりやすいエラーにする
+    return {
+      status: 'error',
+      message: `GAS Web Appから予期しない応答(JSON以外)が返されました。status=${res.status} 内容の先頭: ${rawText.slice(0, 200)}`,
+    };
+  }
 }
 
 /** ページ末尾まで少しずつスクロールし、遅延読み込み(lazy load)の画像等を読み込ませる */
