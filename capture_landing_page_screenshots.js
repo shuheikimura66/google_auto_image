@@ -111,8 +111,20 @@ async function main() {
     return;
   }
 
-  const browser = await chromium.launch();
-  const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+  const browser = await chromium.launch({
+    args: ['--disable-blink-features=AutomationControlled'],
+  });
+  const context = await browser.newContext({
+    viewport: { width: 1280, height: 900 },
+    userAgent:
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+      '(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+  });
+  // navigator.webdriver フラグ等を隠し、ボット検知(クローキング)による
+  // 空白ページ返却を避けるための対策
+  await context.addInitScript(() => {
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+  });
   const page = await context.newPage();
 
   let succeeded = 0;
@@ -121,12 +133,26 @@ async function main() {
   for (const targetUrl of pendingUrls) {
     console.log(`\n=== ${targetUrl} ===`);
     try {
-      await page.goto(targetUrl, { waitUntil: 'networkidle', timeout: 30000 });
+      const response = await page.goto(targetUrl, { waitUntil: 'networkidle', timeout: 30000 });
+
+      if (!response || !response.ok()) {
+        const status = response ? response.status() : '(レスポンス無し)';
+        console.warn(`  ⚠ スキップ: ページが正常に開けませんでした(status: ${status})。トラッキングURL等で直接アクセスできない可能性があります。`);
+        failed++;
+        continue;
+      }
+
       await autoScrollToBottom(page);
       await page.evaluate(() => window.scrollTo(0, 0));
       await page.waitForTimeout(500); // スクロール後、先頭表示が安定するまで少し待つ
 
       const rawBuffer = await page.screenshot({ fullPage: true, type: 'jpeg', quality: 70 });
+      if (!rawBuffer || rawBuffer.length === 0) {
+        console.warn('  ⚠ スキップ: スクリーンショットが空でした(ページの内容が実質空白の可能性)。');
+        failed++;
+        continue;
+      }
+
       const buffer = await resizeScreenshotIfNeeded(rawBuffer);
       const base64 = buffer.toString('base64');
 
