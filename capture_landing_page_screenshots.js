@@ -23,6 +23,7 @@
  */
 
 const { chromium } = require('playwright');
+const sharp = require('sharp');
 
 const GAS_WEBAPP_URL = process.env.GAS_WEBAPP_URL;
 const GAS_SHARED_SECRET = process.env.GAS_SHARED_SECRET || '';
@@ -81,6 +82,26 @@ async function autoScrollToBottom(page) {
   await page.waitForTimeout(1000);
 }
 
+/**
+ * フルページスクリーンショットが極端に縦長になりGeminiの画像処理エラーの原因になるため、
+ * 縦のサイズが上限を超える場合は、横幅を維持したまま上部から上限の高さまでで切り取る
+ * （プロポーショナルに縮小すると文字が読めなくなるため、クロップ方式にしている）。
+ * トークン消費量の削減にも効果がある。
+ */
+const MAX_SCREENSHOT_HEIGHT = 4000;
+
+async function resizeScreenshotIfNeeded(buffer) {
+  const metadata = await sharp(buffer).metadata();
+  if (!metadata.height || metadata.height <= MAX_SCREENSHOT_HEIGHT) {
+    return buffer;
+  }
+  console.log(`  スクリーンショットが縦長(${metadata.width}x${metadata.height})のため、上部${MAX_SCREENSHOT_HEIGHT}pxのみ切り取ります`);
+  return sharp(buffer)
+    .extract({ left: 0, top: 0, width: metadata.width, height: MAX_SCREENSHOT_HEIGHT })
+    .jpeg({ quality: 70 })
+    .toBuffer();
+}
+
 async function main() {
   const pendingUrls = await fetchPendingUrls();
   console.log(`撮影対象URL: ${pendingUrls.length} 件`);
@@ -105,7 +126,8 @@ async function main() {
       await page.evaluate(() => window.scrollTo(0, 0));
       await page.waitForTimeout(500); // スクロール後、先頭表示が安定するまで少し待つ
 
-      const buffer = await page.screenshot({ fullPage: true, type: 'jpeg', quality: 70 });
+      const rawBuffer = await page.screenshot({ fullPage: true, type: 'jpeg', quality: 70 });
+      const buffer = await resizeScreenshotIfNeeded(rawBuffer);
       const base64 = buffer.toString('base64');
 
       const result = await uploadScreenshotToGas(targetUrl, base64);
