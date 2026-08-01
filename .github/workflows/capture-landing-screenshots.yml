@@ -17,16 +17,16 @@ jobs:
           node-version: '20'
 
       - name: 日本語フォントのインストール
-        run: sudo apt-get update && sudo apt-get install -y fonts-noto-cjk
+        run: sudo apt-get update && sudo apt-get install -y fonts-noto-cjk xvfb
 
       - name: 依存パッケージのインストール
         run: npm install
 
-      - name: Playwright ブラウザのインストール
-        run: npx playwright install chromium
+      - name: Google Chrome(本体)のインストール
+        run: npx playwright install --with-deps chrome
 
-      - name: スクリーンショット取得スクリプトを実行
+      - name: スクリーンショット取得スクリプトを実行(仮想ディスプレイ上でヘッド付き実行)
         env:
           GAS_WEBAPP_URL: ${{ secrets.GAS_WEBAPP_URL }}
           GAS_SHARED_SECRET: ${{ secrets.GAS_SHARED_SECRET }}
-        run: node capture_landing_page_screenshots.js
+        run: xvfb-run --auto-servernum node capture_landing_page_screenshots.js
