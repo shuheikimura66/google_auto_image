@@ -122,6 +122,8 @@ async function main() {
   }
 
   const browser = await chromium.launch({
+    headless: false, // ヘッドレス特有の検知(WebGLレンダラー等)を避けるため、画面表示ありで起動
+    channel: 'chrome', // Playwright内蔵のChromiumではなく、本物のGoogle Chromeを使う
     args: ['--disable-blink-features=AutomationControlled'],
   });
   const context = await browser.newContext({
